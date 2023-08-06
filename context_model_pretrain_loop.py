@@ -46,6 +46,7 @@ def create_optimizer(model,
                      lr: float = 0.001,
                      weight_decay: float = 0.03,
                      warmup_steps: int = 10000,
+                     total_steps=120000,
                      ) -> Tuple[torch.optim.Optimizer, torch.optim.lr_scheduler._LRScheduler]:
   param_list = []
   for param_name, param in model.named_parameters():
@@ -56,7 +57,7 @@ def create_optimizer(model,
   #   optimizer=opt,
   #   lr_lambda=[partial(linear_warmup, warmup_steps=warmup_steps)]  # for shared paramters],
   # )
-  scheduler = CustomWarmupCosineSchedule(opt, warmup_steps=warmup_steps, t_total=120000, final_lr=lr /10)
+  scheduler = CustomWarmupCosineSchedule(opt, warmup_steps=warmup_steps, t_total=total_steps, final_lr=lr /10)
   return opt, scheduler
 
 

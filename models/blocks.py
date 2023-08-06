@@ -325,12 +325,12 @@ class OrigEncoderBlock(nn.Module):
     self.ln_1 = norm_layer(hidden_dim)
     self.self_attention = nn.MultiheadAttention(hidden_dim, num_heads, dropout=attention_dropout, batch_first=True)
     self.dropout = nn.Dropout(dropout)
-    self.dp_1 = DropPath(0.2)
+    self.dp_1 = DropPath(0.1)
 
     # MLP block
     self.ln_2 = norm_layer(hidden_dim)
     self.mlp = MLPBlock(hidden_dim, mlp_dim, dropout)
-    self.dp_2 = DropPath(0.2)
+    self.dp_2 = DropPath(0.1)
 
   def forward(self, input: torch.Tensor):
     torch._assert(input.dim() == 3, f"Expected (batch_size, seq_length, hidden_dim) got {input.shape}")

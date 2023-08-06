@@ -454,8 +454,9 @@ def eval_context_model(
       embedded_features = embedding_model(batch)
       # This is a no-op if embedding_model is a lambda.
       batch.node_features = embedded_features
-      predictions: BatchOutputType = model.forward_test(train_batch, batch, train_labels.to(torch.float32),
-                                                        labels.to(torch.float32), context_length=16)
+      predictions = model.forward_test(train_batch, batch, train_labels.to(torch.float32), labels.to(torch.float32))
+      # predictions: BatchOutputType = model.forward_test(train_batch, batch, train_labels.to(torch.float32),
+      #                                                   labels.to(torch.float32), context_length=16)
 
     # === Finally, collect per-task results to be used for further eval:
     sample_to_task_id: Dict[int, int] = {}
@@ -467,7 +468,8 @@ def eval_context_model(
 
     # Apply sigmoid to have predictions in appropriate range for computing (scikit) scores.
     num_samples = labels.shape[0]
-    predicted_labels = torch.sigmoid(predictions).detach().cpu()
+    # predicted_labels = torch.sigmoid(predictions).detach().cpu()
+    predicted_labels = torch.nn.functional.softmax(predictions, dim=1)[:, 1]
     for i in range(num_samples):
       task_id = sample_to_task_id[i].item()
       per_task_preds[task_id].append(predicted_labels[i].item())

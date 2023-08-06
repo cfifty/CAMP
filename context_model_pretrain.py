@@ -105,6 +105,7 @@ def add_train_loop_arguments(parser: argparse.ArgumentParser):
   parser.add_argument("--num_epochs", type=int, default=100)
   parser.add_argument("--patience", type=int, default=10)
   parser.add_argument("--cuda", type=int, default=5)
+  parser.add_argument("--total_steps", type=int, default=120000)
   parser.add_argument("--context_lengths", type=int,nargs='+', default=[16, 32, 64, 128, 256])
   parser.add_argument("--batch_sizes", type=int, nargs='+', default=[2048, 1024, 512, 256, 128])
   parser.add_argument("--model_size", default='base')
@@ -164,7 +165,7 @@ def main():
   add_train_loop_arguments(parser)
   args = parser.parse_args()
   save_name = (
-    f'{args.model_type}_{args.metric}_{args.model_size}_{args.learning_rate}_{args.dropout}_{args.weight_decay}_{args.warmup_steps}_{args.context_lengths}_{args.batch_sizes}_{args.attention_dropout}')
+    f'{args.model_type}_{args.metric}_{args.model_size}_{args.learning_rate}_{args.dropout}_{args.total_steps}_{args.warmup_steps}_{args.context_lengths}_{args.batch_sizes}_{args.attention_dropout}')
   out_dir, fsmol_dataset, aml_run = set_up_train_run(f"{save_name}_{args.model_type}", args, torch=True)
   device = torch.device(f'cuda:{args.cuda}' if torch.cuda.is_available() else "cpu")
 
@@ -180,12 +181,15 @@ def main():
   valid_task_name_to_id = {
     name: i for i, name in enumerate(fsmol_dataset.get_task_names(data_fold=DataFold.VALIDATION))
   }
-
+  # with [128, 64, 32, 16, 8], we have 6800 steps/epoch
+  # 50 epochs will be 340,000 total steps
+  # 100 epochs will be 680,000 total steps.
   optimizer, lr_scheduler = create_optimizer(
     model,
     lr=args.learning_rate,
     weight_decay=args.weight_decay,
     warmup_steps=args.warmup_steps,
+    total_steps=args.total_steps,
   )
   if 'fsmol' in args.DATA_PATH:
     if 'ProtoICL' in args.model_type:

@@ -11,6 +11,8 @@ import os
 
 sys.path.insert(0, str(project_root()))
 
+from context_model_pretrain import make_model
+
 from fs_mol.data.fsmol_task import FSMolTaskSample
 from fs_mol.data.multitask import get_multitask_inference_batcher
 from fs_mol.models.abstract_torch_fsmol_model import resolve_starting_model_file
@@ -57,6 +59,10 @@ python fs_mol/context_modeling_test.py . ../fsmol_datasets --save-dir ../v2_mlcm
 python fs_mol/context_modeling_test.py . ../fsmol_datasets --save-dir ../v2_mlcm_eval \
 --model_type ContextTransformer_v2 --model_path '../v2_mlcm/m3/best_model.pt' --train-sizes [16]
 
+
+*******Rebuttal Models*********
+python fs_mol/context_modeling_test.py . ../fsmol_datasets --save-dir MH128  --model_type ProtoICL \
+--model_path 'mahalanobis/ProtoICL_mahalanobis_base_5e-05_0.0_400000_100_[128, 16]_[256, 256]_0.0_ProtoICL_2023-08-05_19-25-46/best_model.pt'  
 """
 
 
@@ -64,6 +70,20 @@ def parse_command_line():
   parser = argparse.ArgumentParser(
     description="Test finetuning a GNN Multitask model on tasks.",
     formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+  )
+  parser.add_argument("--metric", default='None')
+  parser.add_argument("--model_size", default='base')
+  parser.add_argument(
+    "--dropout",
+    type=float,
+    default=0.0,
+    help="Dropout for molecular Transformer.",
+  )
+  parser.add_argument(
+    "--attention_dropout",
+    type=float,
+    default=0.0,
+    help="Attention Dropout for molecular Transformer.",
   )
 
   parser.add_argument(
@@ -105,19 +125,19 @@ def parse_command_line():
   return parser.parse_args()
 
 
-def make_model(model_size: Text, model_type: Text = 'MoleculeTransformer', device: Optional[torch.device] = None):
-  if model_size == 'small':
-    return mt_small_32(device=device, model_type=model_type)
-  if model_size == 'medium':
-    return mt_medium_32(device=device, model_type=model_type)
-  if model_size == 'base':
-    return mt_base_32(device=device, model_type=model_type)
-  elif model_size == 'large':
-    return mt_large_32(device=device, model_type=model_type)
-  elif model_size == 'huge':
-    return mt_huge_32(device=device, model_type=model_type)
-  else:
-    raise Exception(f'model size: {model_size} is not one of base, large, or huge. Not recognized.')
+# def make_model(model_size: Text, model_type: Text = 'MoleculeTransformer', device: Optional[torch.device] = None):
+#   if model_size == 'small':
+#     return mt_small_32(device=device, model_type=model_type)
+#   if model_size == 'medium':
+#     return mt_medium_32(device=device, model_type=model_type)
+#   if model_size == 'base':
+#     return mt_base_32(device=device, model_type=model_type)
+#   elif model_size == 'large':
+#     return mt_large_32(device=device, model_type=model_type)
+#   elif model_size == 'huge':
+#     return mt_huge_32(device=device, model_type=model_type)
+#   else:
+#     raise Exception(f'model size: {model_size} is not one of base, large, or huge. Not recognized.')
 
 
 def main():
@@ -130,7 +150,8 @@ def main():
   set_up_logging(os.path.join(out_dir, f"eval_run.log"))
 
   device = torch.device(f"cuda:{args.cuda}" if torch.cuda.is_available() else "cpu")
-  model = make_model('base', args.model_type, device=device)
+  # model = make_model('base', args.model_type, device=device)
+  model = make_model(args, model_size=args.model_size, model_type=args.model_type, device=device)
   # model.load_state_dict(torch.load(
   #   '/lfs/local/0/fifty/context_modeling/v3/ContextTransformer_v3_base_5e-05_0.0_0.0_100_256_ContextTransformer_v3_2023-04-20_13-51-50/best_model.pt'))
   # model.load_state_dict(torch.load(

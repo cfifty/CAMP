@@ -76,7 +76,7 @@ def add_eval_cli_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--train-sizes",
         type=json.loads,
-        default=[16, 32, 64, 128, 256],
+        default=[8, 16, 32, 64, 128],
         help="JSON list of number of training points to sample.",
     )
 

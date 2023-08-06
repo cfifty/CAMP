@@ -350,9 +350,9 @@ class ProtoICL(ContextTransformer_Orig):
 
       # Do not divide by (num -1) b/c some examples have only a single example from the other class.
       cov_neg = ((x * neg_centroids_mask - e_neg) * neg_centroids_mask).transpose(1, 2) @ (
-              (x * neg_centroids_mask - e_neg) * neg_centroids_mask) / (num_neg -1)
+              (x * neg_centroids_mask - e_neg) * neg_centroids_mask) / (num_neg - 1)
       cov_pos = ((x * pos_centroids_mask - e_pos) * pos_centroids_mask).transpose(1, 2) @ (
-              (x * pos_centroids_mask - e_pos) * pos_centroids_mask) / (num_pos -1)
+              (x * pos_centroids_mask - e_pos) * pos_centroids_mask) / (num_pos - 1)
 
       S_inv_pos = torch.inverse(pos_lambda_k_tau * cov_pos + ((1 - pos_lambda_k_tau) * full_cov) + stable_term)
       S_inv_neg = torch.inverse(neg_lambda_k_tau * cov_neg + ((1 - neg_lambda_k_tau) * full_cov) + stable_term)
@@ -362,6 +362,281 @@ class ProtoICL(ContextTransformer_Orig):
       scores = torch.cat((d_neg, d_pos), dim=1)
 
     return scores, init_labels[legit_batches]
+
+  def forward_test(self, support, query, support_labels, query_labels):
+    # Step 1: get features and labels.
+    support = self.gnn_extractor(support)
+    query = self.gnn_extractor(query)
+
+    S, _ = support.shape
+    B, D = query.shape
+    support = support.unsqueeze(0).repeat(B, 1, 1)
+    query = query.unsqueeze(1)
+    features = torch.cat([query, support], dim=1)
+
+    # Cat -1 to labels since the first position will always be the query.
+    labels = torch.cat(
+      [(-1 * torch.ones(B, 1, 1).to(support.device)), support_labels.unsqueeze(1).unsqueeze(0).repeat(B, 1, 1)], dim=1)
+
+    support_labels = self.class_emb(support_labels.unsqueeze(1)).unsqueeze(0).repeat(B, 1, 1)
+    support_labels = torch.cat([self.label_emb.repeat(B, 1, 1), support_labels], dim=1)
+
+    demonstrations = torch.cat([features, support_labels], dim=-1)
+    x = self.encoder(demonstrations, None)
+
+    # Extract query and aggregate support into centroids.
+    query = x[:,[0],:]
+    pos_centroids_mask = torch.where(labels == 1.0, 1.0, 0.0)
+    neg_centroids_mask = torch.where(labels == 0.0, 1.0, 0.0)
+    num_pos = (torch.sum(pos_centroids_mask, dim=1)).unsqueeze(-1)
+    num_neg = (torch.sum(neg_centroids_mask, dim=1)).unsqueeze(-1)
+
+    pos_centroids = torch.sum(x * pos_centroids_mask, dim=1) / torch.sum(pos_centroids_mask, dim=1)
+    neg_centroids = torch.sum(x * neg_centroids_mask, dim=1) / torch.sum(neg_centroids_mask, dim=1)
+    centroids = torch.stack((neg_centroids, pos_centroids), dim=1)
+
+    if self.metric == 'cosine':
+      query = torch.nn.functional.normalize(query, p=2, dim=query.dim() - 1, eps=1e-12)
+      centroids = torch.nn.functional.normalize(centroids, p=2, dim=centroids.dim() - 1, eps=1e-12)
+      scores = (query @ centroids.transpose(1, 2)).squeeze()
+      scores = self.scale_cls * (scores + self.bias)
+    elif self.metric == 'mahalanobis':
+      # Computing covariance is a bit more difficult; we'll have to 0-out entries in each centroid.
+      e_neg = neg_centroids.unsqueeze(1)  # Expected value of the negative centroids.
+      e_pos = pos_centroids.unsqueeze(1)  # Expected value o the positive centroids.
+
+      # TODO(fifty): Begin weird black magic?
+      B, S, D = x.shape
+      support_mask = torch.where(labels != -1, 1.0, 0.0)
+      e_support = torch.sum(x * support_mask, dim=1, keepdim=True) / (S - 1)
+      full_cov = ((x * support_mask - e_support) * support_mask).transpose(1, 2) @ (
+        ((x * support_mask - e_support) * support_mask)) / (S - 1)
+
+      stable_term = 0.1 * torch.eye(D, device=x.device).unsqueeze(0)
+
+      neg_lambda_k_tau = torch.minimum(num_neg / (num_neg + 1), torch.Tensor([0.1]).to(x.device))
+      pos_lambda_k_tau = torch.minimum(num_pos / (num_pos + 1), torch.Tensor([0.1]).to(x.device))
+      # TODO(cfifty): End black magic?
+
+      # Do not divide by (num -1) b/c some examples have only a single example from the other class.
+      cov_neg = ((x * neg_centroids_mask - e_neg) * neg_centroids_mask).transpose(1, 2) @ (
+              (x * neg_centroids_mask - e_neg) * neg_centroids_mask) / (num_neg - 1)
+      cov_pos = ((x * pos_centroids_mask - e_pos) * pos_centroids_mask).transpose(1, 2) @ (
+              (x * pos_centroids_mask - e_pos) * pos_centroids_mask) / (num_pos - 1)
+
+      S_inv_pos = torch.inverse(pos_lambda_k_tau * cov_pos + ((1 - pos_lambda_k_tau) * full_cov) + stable_term)
+      S_inv_neg = torch.inverse(neg_lambda_k_tau * cov_neg + ((1 - neg_lambda_k_tau) * full_cov) + stable_term)
+
+      d_pos = -1 * torch.einsum('bsd,bds->bs', ((query - e_pos) @ S_inv_pos), (query - e_pos).transpose(1, 2))
+      d_neg = -1 * torch.einsum('bsd,bds->bs', ((query - e_neg) @ S_inv_neg), (query - e_neg).transpose(1, 2))
+      scores = torch.cat((d_neg, d_pos), dim=1)
+    else:
+      raise Exception(f'self.metric {self.metric} is not recognized.')
+
+    return scores
+
+
+class ECFPProtoICL(ContextTransformer_Orig):
+  def __init__(
+          self,
+          name: Text,
+          atom_dim: int,
+          num_layers: int,
+          num_heads: int,
+          hidden_dim: int,
+          mlp_dim: int,
+          device: torch.device,
+          dropout: float = 0.0,
+          attention_dropout: float = 0.0,
+          metric: Text = '',
+          norm_layer: Callable[..., torch.nn.Module] = partial(nn.LayerNorm, eps=1e-6),
+  ):
+    super().__init__(atom_dim, num_layers, num_heads, hidden_dim, mlp_dim, device, dropout, attention_dropout,
+                     norm_layer)
+    self.name = name
+    # bias & scale of cosine classifier
+    self.bias = nn.Parameter(torch.FloatTensor(1).fill_(0), requires_grad=True)
+    self.scale_cls = nn.Parameter(torch.FloatTensor(1).fill_(10), requires_grad=True)
+    # self.metric = 'mahalanobis'
+    self.metric = metric
+
+    self.gnn_extractor = MPNNFeatureExtractor(atom_dim, 384, num_heads).to(device)
+    self.ecfp_proj = nn.Sequential(nn.Linear(2048, 1024), nn.ReLU(), nn.Dropout(0.3), nn.Linear(1024, 128))
+    self.class_emb = torch.nn.Linear(in_features=1, out_features=256, bias=False)
+    self.label_emb = torch.nn.Parameter(torch.zeros(1, 1, 256))
+
+  def forward(self, x, y, context_length, *args, **kwargs):
+    # Step 1: get features and labels.
+    x_ecfp = self.ecfp_proj(x.fingerprints.to(torch.float32))
+
+    x = self.gnn_extractor(x)
+    x = torch.cat([x, x_ecfp], dim=-1)
+
+    init_labels = y
+    labels = torch.unsqueeze(y, 1)
+    y = self.class_emb(torch.unsqueeze(y, 1))
+
+    # Step 2: Map the first extracted features to a "guess" label.
+    B, _ = x.shape
+    x = x.reshape(B // context_length, context_length, -1)
+    y = y.reshape(B // context_length, context_length, -1)
+    labels = labels.reshape(B // context_length, context_length, -1).repeat_interleave(context_length, dim=0)
+
+    # Repeat each example |context| so that we predict on each molecule in the context.
+    x, y, gather_idx = replicate_batch(x, y)
+
+    # Add positional Embeddings.
+    query_mask = torch.eye(context_length, device=x.device, dtype=torch.bool).repeat(B // context_length, 1).unsqueeze(
+      -1)
+    y += self.label_emb * query_mask - y * query_mask  # Replace the true label w/ the masked token.
+
+    # Concatenate molecule embeddings and label embeddings along last axis.
+    x = torch.cat((x, y), dim=-1)
+
+    # Step 3: Pass inputs and labels through the context model.
+    x = self.encoder(x, None, **kwargs)
+
+    # Step 4: Extract query and aggregate support into centroids.
+    query = torch.take_along_dim(x, gather_idx.reshape(-1, 1, 1), 1)
+    labels[query_mask] = -1  # Set queries to -1 to not get pulled into centroids.
+    pos_centroids_mask = torch.where(labels == 1.0, 1.0, 0.0)
+    neg_centroids_mask = torch.where(labels == 0.0, 1.0, 0.0)
+
+    num_pos = (torch.sum(pos_centroids_mask, dim=1)).unsqueeze(-1)
+    num_neg = (torch.sum(neg_centroids_mask, dim=1)).unsqueeze(-1)
+
+    # Will get nans for batches with support belonging to a single class -- nan_to_num 0s out these b/c autodiff.
+    # Handle illegitimate batches.
+    legit_batches = torch.where(torch.logical_and(num_pos > 1, num_neg > 1), True, False).squeeze()
+    num_pos = num_pos[legit_batches]
+    num_neg = num_neg[legit_batches]
+    pos_centroids_mask = pos_centroids_mask[legit_batches]
+    neg_centroids_mask = neg_centroids_mask[legit_batches]
+    query = query[legit_batches]
+    x = x[legit_batches]
+    labels = labels[legit_batches]
+
+    # TODO(cfifty): check that all batches are legit? What if not a single one is...
+    # Immediately return if no legit batches.
+    if x.shape[0] == 0:
+      return x, labels
+
+    pos_centroids = torch.sum(x * pos_centroids_mask, dim=1) / torch.sum(pos_centroids_mask, dim=1)
+    neg_centroids = torch.sum(x * neg_centroids_mask, dim=1) / torch.sum(neg_centroids_mask, dim=1)
+
+    centroids = torch.stack((neg_centroids, pos_centroids), dim=1)
+
+    if self.metric == 'cosine':
+      query = torch.nn.functional.normalize(query, p=2, dim=query.dim() - 1, eps=1e-12)
+      centroids = torch.nn.functional.normalize(centroids, p=2, dim=centroids.dim() - 1, eps=1e-12)
+      scores = (query @ centroids.transpose(1, 2)).squeeze()
+      scores = self.scale_cls * (scores + self.bias)
+    elif self.metric == 'euclidean':
+      scores = -1 * (query - centroids).pow(2).sum(dim=2)
+    elif self.metric == 'mahalanobis':
+      # Computing covariance is a bit more difficult; we'll have to 0-out entries in each centroid.
+      e_neg = neg_centroids.unsqueeze(1)  # Expected value of the negative centroids.
+      e_pos = pos_centroids.unsqueeze(1)  # Expected value o the positive centroids.
+
+      # TODO(fifty): Begin weird black magic?
+      B, S, D = x.shape
+      support_mask = torch.where(labels != -1, 1.0, 0.0)
+      e_support = torch.sum(x * support_mask, dim=1, keepdim=True) / (S - 1)
+      full_cov = ((x * support_mask - e_support) * support_mask).transpose(1, 2) @ (
+        ((x * support_mask - e_support) * support_mask)) / (S - 1)
+
+      stable_term = 0.1 * torch.eye(D, device=x.device).unsqueeze(0)
+
+      neg_lambda_k_tau = torch.minimum(num_neg / (num_neg + 1), torch.Tensor([0.1]).to(x.device))
+      pos_lambda_k_tau = torch.minimum(num_pos / (num_pos + 1), torch.Tensor([0.1]).to(x.device))
+      # TODO(cfifty): End black magic?
+
+      # Do not divide by (num -1) b/c some examples have only a single example from the other class.
+      cov_neg = ((x * neg_centroids_mask - e_neg) * neg_centroids_mask).transpose(1, 2) @ (
+              (x * neg_centroids_mask - e_neg) * neg_centroids_mask) / (num_neg - 1)
+      cov_pos = ((x * pos_centroids_mask - e_pos) * pos_centroids_mask).transpose(1, 2) @ (
+              (x * pos_centroids_mask - e_pos) * pos_centroids_mask) / (num_pos - 1)
+
+      S_inv_pos = torch.inverse(pos_lambda_k_tau * cov_pos + ((1 - pos_lambda_k_tau) * full_cov) + stable_term)
+      S_inv_neg = torch.inverse(neg_lambda_k_tau * cov_neg + ((1 - neg_lambda_k_tau) * full_cov) + stable_term)
+
+      d_pos = -1 * torch.einsum('bsd,bds->bs', ((query - e_pos) @ S_inv_pos), (query - e_pos).transpose(1, 2))
+      d_neg = -1 * torch.einsum('bsd,bds->bs', ((query - e_neg) @ S_inv_neg), (query - e_neg).transpose(1, 2))
+      scores = torch.cat((d_neg, d_pos), dim=1)
+
+    return scores, init_labels[legit_batches]
+
+  def forward_test(self, support, query, support_labels, query_labels):
+    # Step 1: get features and labels.
+    support = self.gnn_extractor(support)
+    query = self.gnn_extractor(query)
+
+    S, _ = support.shape
+    B, D = query.shape
+    support = support.unsqueeze(0).repeat(B, 1, 1)
+    query = query.unsqueeze(1)
+    features = torch.cat([query, support], dim=1)
+
+    # Cat -1 to labels since the first position will always be the query.
+    labels = torch.cat(
+      [(-1 * torch.ones(B, 1, 1).to(support.device)), support_labels.unsqueeze(1).unsqueeze(0).repeat(B, 1, 1)], dim=1)
+
+    support_labels = self.class_emb(support_labels.unsqueeze(1)).unsqueeze(0).repeat(B, 1, 1)
+    support_labels = torch.cat([self.label_emb.repeat(B, 1, 1), support_labels], dim=1)
+
+    demonstrations = torch.cat([features, support_labels], dim=-1)
+    x = self.encoder(demonstrations, None)
+
+    # Extract query and aggregate support into centroids.
+    query = x[:,[0],:]
+    pos_centroids_mask = torch.where(labels == 1.0, 1.0, 0.0)
+    neg_centroids_mask = torch.where(labels == 0.0, 1.0, 0.0)
+    num_pos = (torch.sum(pos_centroids_mask, dim=1)).unsqueeze(-1)
+    num_neg = (torch.sum(neg_centroids_mask, dim=1)).unsqueeze(-1)
+
+    pos_centroids = torch.sum(x * pos_centroids_mask, dim=1) / torch.sum(pos_centroids_mask, dim=1)
+    neg_centroids = torch.sum(x * neg_centroids_mask, dim=1) / torch.sum(neg_centroids_mask, dim=1)
+    centroids = torch.stack((neg_centroids, pos_centroids), dim=1)
+
+    if self.metric == 'cosine':
+      query = torch.nn.functional.normalize(query, p=2, dim=query.dim() - 1, eps=1e-12)
+      centroids = torch.nn.functional.normalize(centroids, p=2, dim=centroids.dim() - 1, eps=1e-12)
+      scores = (query @ centroids.transpose(1, 2)).squeeze()
+      scores = self.scale_cls * (scores + self.bias)
+    elif self.metric == 'mahalanobis':
+      # Computing covariance is a bit more difficult; we'll have to 0-out entries in each centroid.
+      e_neg = neg_centroids.unsqueeze(1)  # Expected value of the negative centroids.
+      e_pos = pos_centroids.unsqueeze(1)  # Expected value o the positive centroids.
+
+      # TODO(fifty): Begin weird black magic?
+      B, S, D = x.shape
+      support_mask = torch.where(labels != -1, 1.0, 0.0)
+      e_support = torch.sum(x * support_mask, dim=1, keepdim=True) / (S - 1)
+      full_cov = ((x * support_mask - e_support) * support_mask).transpose(1, 2) @ (
+        ((x * support_mask - e_support) * support_mask)) / (S - 1)
+
+      stable_term = 0.1 * torch.eye(D, device=x.device).unsqueeze(0)
+
+      neg_lambda_k_tau = torch.minimum(num_neg / (num_neg + 1), torch.Tensor([0.1]).to(x.device))
+      pos_lambda_k_tau = torch.minimum(num_pos / (num_pos + 1), torch.Tensor([0.1]).to(x.device))
+      # TODO(cfifty): End black magic?
+
+      # Do not divide by (num -1) b/c some examples have only a single example from the other class.
+      cov_neg = ((x * neg_centroids_mask - e_neg) * neg_centroids_mask).transpose(1, 2) @ (
+              (x * neg_centroids_mask - e_neg) * neg_centroids_mask) / (num_neg - 1)
+      cov_pos = ((x * pos_centroids_mask - e_pos) * pos_centroids_mask).transpose(1, 2) @ (
+              (x * pos_centroids_mask - e_pos) * pos_centroids_mask) / (num_pos - 1)
+
+      S_inv_pos = torch.inverse(pos_lambda_k_tau * cov_pos + ((1 - pos_lambda_k_tau) * full_cov) + stable_term)
+      S_inv_neg = torch.inverse(neg_lambda_k_tau * cov_neg + ((1 - neg_lambda_k_tau) * full_cov) + stable_term)
+
+      d_pos = -1 * torch.einsum('bsd,bds->bs', ((query - e_pos) @ S_inv_pos), (query - e_pos).transpose(1, 2))
+      d_neg = -1 * torch.einsum('bsd,bds->bs', ((query - e_neg) @ S_inv_neg), (query - e_neg).transpose(1, 2))
+      scores = torch.cat((d_neg, d_pos), dim=1)
+    else:
+      raise Exception(f'self.metric {self.metric} is not recognized.')
+
+    return scores
 
 
 class ContextTransformer_v2(MoleculeTransformer):
@@ -822,6 +1097,17 @@ def _molecule_transformer(
     )
   elif model_type == 'ProtoICL':
     model = ProtoICL(
+      name='ProtoICL',
+      atom_dim=atom_dim,
+      num_layers=num_layers,
+      num_heads=num_heads,
+      hidden_dim=hidden_dim,
+      mlp_dim=mlp_dim,
+      device=device,
+      **kwargs,
+    )
+  elif model_type == 'ECFPProtoICL':
+    model = ECFPProtoICL(
       name='ProtoICL',
       atom_dim=atom_dim,
       num_layers=num_layers,
