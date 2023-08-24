@@ -13,7 +13,7 @@ from pyprojroot import here as project_root
 
 sys.path.insert(0, str(project_root()))
 
-from models.attention_mechanisms import MATAttention, TDAttention, ContextAttention
+from models.attention_mechanisms import MATAttention, TDAttention, ContextAttention, RelativeAttention
 from modules.gnn import GNNConfig, GNN
 from modules.graph_readout import GraphReadoutConfig
 from modules.vit_utils import DropPath
@@ -69,114 +69,6 @@ class MPNNFeatureExtractor(nn.Module):
   def forward(self, x, *args, **kwargs) -> torch.Tensor:
     return self.gfe(x)
 
-
-class ContextEncoder(nn.Module):
-  """ContextEncoder."""
-
-  def __init__(
-          self,
-          num_layers: int,
-          num_heads: int,
-          hidden_dim: int,
-          mlp_dim: int,
-          dropout: float,
-          attention_dropout: float,
-          norm_layer: Callable[..., torch.nn.Module] = partial(nn.LayerNorm, eps=1e-6),
-  ):
-    super().__init__()
-    self.dropout = nn.Dropout(dropout)
-    layers: OrderedDict[str, nn.Module] = OrderedDict()
-    for i in range(num_layers):
-      layers[f"encoder_layer_{i}"] = ContextEncoderBlock(
-        num_heads,
-        hidden_dim,
-        mlp_dim,
-        dropout,
-        attention_dropout,
-        norm_layer,
-      )
-    self.layers = nn.Sequential(layers)
-    self.ln = norm_layer(hidden_dim)
-
-  def forward(self, x, y, *args, **kwargs):
-    torch._assert(x.dim() == 3, f"Expected (batch_size, seq_length, hidden_dim) got {x.shape}")
-    x = self.dropout(x)
-    for layer in self.layers:
-      x, y = layer.forward(x, y)
-    return self.ln(x), y
-
-class RebuttalEncoder(nn.Module):
-  """I ain't fucking around anymore."""
-  def __init__(
-          self,
-          num_layers: int,
-          num_heads: int,
-          hidden_dim: int,
-          mlp_dim: int,
-          dropout: float,
-          attention_dropout: float,
-          norm_layer: Callable[..., torch.nn.Module] = partial(nn.LayerNorm, eps=1e-6),
-  ):
-    super().__init__()
-    self.dropout = nn.Dropout(dropout)
-    layers: OrderedDict[str, nn.Module] = OrderedDict()
-    for i in range(num_layers):
-      layers[f"encoder_layer_{i}"] = EncoderBlock(
-        num_heads,
-        hidden_dim,
-        mlp_dim,
-        dropout,
-        attention_dropout,
-        norm_layer,
-      )
-    self.layers = nn.Sequential(layers)
-    self.ln = norm_layer(hidden_dim)
-
-  def forward(self, x: torch.Tensor, y, gather_idx, *args, **kwargs):
-    cls_tokens = []
-    x = self.dropout(x)
-    for layer in self.layers:
-      x = layer(x)
-      # Extract the query from the sequence in each batch.
-      query = torch.take_along_dim(x, gather_idx.reshape(-1, 1, 1), 1)
-      cls_tokens.append(query)
-    return self.ln(x), torch.cat(cls_tokens[-2:], dim=1)
-
-
-class RebuttalEncoderBlock(nn.Module):
-  """Really ain't fucking around."""
-
-  def __init__(
-          self,
-          num_heads: int,
-          hidden_dim: int,
-          mlp_dim: int,
-          dropout: float,
-          attention_dropout: float,
-          norm_layer: Callable[..., torch.nn.Module] = partial(nn.LayerNorm, eps=1e-6),
-  ):
-    super().__init__()
-    self.num_heads = num_heads
-
-    # Attention block
-    self.ln_1 = norm_layer(hidden_dim)
-    self.self_attention = nn.MultiheadAttention(hidden_dim, num_heads, dropout=attention_dropout, batch_first=True)
-    self.dropout = nn.Dropout(dropout)
-    self.drop_path1 = DropPath(0.1)
-
-    # MLP block
-    self.ln_2 = norm_layer(hidden_dim)
-    self.mlp = MLPBlock(hidden_dim, mlp_dim, dropout)
-    self.drop_path2 = DropPath(0.1)
-
-  def forward(self, input: torch.Tensor):
-    torch._assert(input.dim() == 3, f"Expected (batch_size, seq_length, hidden_dim) got {input.shape}")
-    x = self.ln_1(input)
-    x = input + self.drop_path1(self.dropout(self.self_attention(query=x, key=x, value=x, need_weights=False)[0]))
-    x = x + self.drop_path2(self.mlp(self.ln_2(x)))
-    return x
-
-
 class Encoder(nn.Module):
   """Transformer Model Encoder for sequence to sequence translation."""
 
@@ -208,6 +100,42 @@ class Encoder(nn.Module):
   def forward(self, x: torch.Tensor, y: torch.Tensor = None, *args, **kwargs):
     torch._assert(x.dim() == 3, f"Expected (batch_size, seq_length, hidden_dim) got {x.shape}")
     return self.ln(self.layers(self.dropout(x)))
+
+
+class RelativeEncoder(nn.Module):
+  """Transformer Model Encoder for sequence to sequence translation."""
+
+  def __init__(
+          self,
+          num_layers: int,
+          num_heads: int,
+          hidden_dim: int,
+          mlp_dim: int,
+          dropout: float,
+          attention_dropout: float,
+          norm_layer: Callable[..., torch.nn.Module] = partial(nn.LayerNorm, eps=1e-6),
+  ):
+    super().__init__()
+    self.dropout = nn.Dropout(dropout)
+    layers: OrderedDict[str, nn.Module] = OrderedDict()
+    for i in range(num_layers):
+      layers[f"encoder_layer_{i}"] = RelativeEncoderBlock(
+        num_heads,
+        hidden_dim,
+        mlp_dim,
+        dropout,
+        attention_dropout,
+        norm_layer,
+      )
+    self.layers = nn.Sequential(layers)
+    self.ln = norm_layer(hidden_dim)
+
+  def forward(self, x: torch.Tensor, ecfp_sim):
+    torch._assert(x.dim() == 3, f"Expected (batch_size, seq_length, hidden_dim) got {x.shape}")
+    x = self.dropout(x)
+    for layer in self.layers:
+      x = layer(x, ecfp_sim)
+    return self.ln(x)
 
 
 class OrigEncoder(Encoder):
@@ -300,6 +228,31 @@ class EncoderBlock(nn.Module):
     x = self.ln_1(input)
     x, _ = self.self_attention(query=x, key=x, value=x, need_weights=False)
     x = self.dropout(x)
+    x = x + input
+
+    y = self.ln_2(x)
+    y = self.mlp(y)
+    return x + y
+
+class RelativeEncoderBlock(EncoderBlock):
+  """Transformer encoder block."""
+
+  def __init__(
+          self,
+          num_heads: int,
+          hidden_dim: int,
+          mlp_dim: int,
+          dropout: float,
+          attention_dropout: float,
+          norm_layer: Callable[..., torch.nn.Module] = partial(nn.LayerNorm, eps=1e-6),
+  ):
+    super().__init__(num_heads, hidden_dim, mlp_dim, dropout, attention_dropout, norm_layer)
+    self.self_attention = RelativeAttention(hidden_dim, num_heads, attn_drop=attention_dropout, proj_drop=dropout)
+
+  def forward(self, input: torch.Tensor, ecfp_sim):
+    torch._assert(input.dim() == 3, f"Expected (batch_size, seq_length, hidden_dim) got {input.shape}")
+    x = self.ln_1(input)
+    x = self.self_attention(x, ecfp_sim)
     x = x + input
 
     y = self.ln_2(x)

@@ -7,14 +7,15 @@ from typing import Any, Callable, Optional, Text
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torchvision.models._api import WeightsEnum
 
 from pyprojroot import here as project_root
 
 sys.path.insert(0, str(project_root()))
 
-from models.blocks import Encoder, ContextEncoder, MPNNFeatureExtractor, PositionalEncoding, RebuttalEncoder, \
-  OrigEncoder
+from models.blocks import Encoder, MPNNFeatureExtractor, PositionalEncoding, \
+  OrigEncoder, RelativeEncoder
 
 
 class MoleculeTransformer(nn.Module):
@@ -42,7 +43,7 @@ class MoleculeTransformer(nn.Module):
 
     self.gnn_extractor = MPNNFeatureExtractor(atom_dim, hidden_dim, num_heads).to(device)
 
-    self.encoder = ContextEncoder(
+    self.encoder = Encoder(
       num_layers,
       num_heads,
       hidden_dim,
@@ -114,7 +115,7 @@ class ContextTransformer_v1(MoleculeTransformer):
   ):
     super().__init__(atom_dim, num_layers, num_heads, hidden_dim, mlp_dim, device, dropout, attention_dropout,
                      norm_layer)
-    self.encoder = ContextEncoder(
+    self.encoder = Encoder(
       num_layers,
       num_heads,
       hidden_dim,
@@ -167,7 +168,7 @@ class ContextTransformer_Orig(MoleculeTransformer):
                      norm_layer)
     # Set gnn_extractor to have output_dim = hidden_dim -1 as we later concatenate this rep with the labels.
     self.gnn_extractor = MPNNFeatureExtractor(atom_dim, 384, num_heads).to(device)
-    self.encoder = OrigEncoder(
+    self.encoder = Encoder(
       num_layers,
       num_heads,
       hidden_dim,
@@ -215,6 +216,7 @@ class ContextTransformer_Orig(MoleculeTransformer):
 
     # Step 7: Linear projection to determine the label.
     return self.output_proj(y)
+    # return y
 
   def forward_test(self, train_examples, test_examples, train_labels, test_labels, context_length):
     # Step 1: Extract molecular graph features with a GNN.
@@ -240,6 +242,304 @@ class ContextTransformer_Orig(MoleculeTransformer):
 
     # Step 7: Linear projection to determine the label.
     return self.output_proj(y)
+
+
+class ContextTransformer_ECFP(ContextTransformer_Orig):
+  def __init__(
+          self,
+          atom_dim: int,
+          num_layers: int,
+          num_heads: int,
+          hidden_dim: int,
+          mlp_dim: int,
+          device: torch.device,
+          dropout: float = 0.0,
+          attention_dropout: float = 0.0,
+          norm_layer: Callable[..., torch.nn.Module] = partial(nn.LayerNorm, eps=1e-6),
+  ):
+    super().__init__(atom_dim, num_layers, num_heads, hidden_dim, mlp_dim, device, dropout, attention_dropout,
+                     norm_layer)
+    self.class_emb = torch.nn.Linear(in_features=1, out_features=383, bias=False)
+    self.label_emb = torch.nn.Parameter(torch.zeros(1, 1, 383))
+    self.gnn_extractor = MPNNFeatureExtractor(atom_dim, 384, num_heads).to(device)
+    self.fc = nn.Sequential(
+      nn.Linear(2048, 1024),
+      nn.ReLU(),
+      nn.Dropout(dropout),
+      nn.Linear(1024, 256),
+      nn.ReLU(),
+      nn.Dropout(dropout),
+      nn.Linear(256, 64),
+      nn.Dropout(dropout),
+      nn.ReLU(),
+      nn.Linear(64, 1)
+    )
+
+  def forward(self, x, y, context_length, *args, **kwargs):
+    # Step 1: Extract molecular graph features with a GNN.
+    # TODO(cfifty): another option is to integrate these into self-attention in a manner similar to relative
+    # TODO(cfifty): positional embeddings: softmax(QK^T + ecfp_sim) where ecfp_sim is a nxn matrix of similarities.
+    fp = x.fingerprints.to(torch.float32)
+    fp = self.fc(fp)
+
+    x = self.gnn_extractor(x)
+    x = torch.cat([x, fp], dim=-1)
+
+    # Combine features across modalities.
+    y = self.class_emb(torch.unsqueeze(y, 1))
+
+    # Step 2: Map the first extracted features to a "guess" label.
+    B, _ = x.shape
+    x = x.reshape(B // context_length, context_length, -1)
+    y = y.reshape(B // context_length, context_length, -1)
+
+    # Repeat each example |context| so that we predict on each molecule in the context.
+    x, y, gather_idx = replicate_batch(x, y)
+
+    # Add positional Embeddings.
+    query_mask = torch.eye(context_length, device=x.device, dtype=torch.bool).repeat(B // context_length, 1).unsqueeze(
+      -1)
+    y += self.label_emb * query_mask - y * query_mask  # Replace the true label w/ the masked token.
+
+    # Concatenate molecule embeddings and label embeddings along last axis.
+    x = torch.cat((x, y), dim=-1)
+
+    # Step 3: Pass inputs and labels through the context model.
+    x = self.encoder(x, None, **kwargs)
+
+    # Step 4: Extract refined "guess" label.
+    y = torch.take_along_dim(x, gather_idx.reshape(-1, 1, 1), 1).squeeze()
+
+    # Step 7: Linear projection to determine the label.
+    return self.output_proj(y)
+
+
+def tanimoto_coef(a, b):
+  intersect = torch.minimum(a, b)
+  tanimoto = intersect / (a + b - intersect)
+  return tanimoto
+
+class ContextTransformer_Relative(ContextTransformer_Orig):
+  def __init__(
+          self,
+          atom_dim: int,
+          num_layers: int,
+          num_heads: int,
+          hidden_dim: int,
+          mlp_dim: int,
+          device: torch.device,
+          dropout: float = 0.0,
+          attention_dropout: float = 0.0,
+          norm_layer: Callable[..., torch.nn.Module] = partial(nn.LayerNorm, eps=1e-6),
+  ):
+    super().__init__(atom_dim, num_layers, num_heads, hidden_dim, mlp_dim, device, dropout, attention_dropout,
+                     norm_layer)
+    self.class_emb = torch.nn.Linear(in_features=1, out_features=384, bias=False)
+    self.label_emb = torch.nn.Parameter(torch.zeros(1, 1, 384))
+    self.gnn_extractor = MPNNFeatureExtractor(atom_dim, 384, num_heads).to(device)
+    self.encoder = RelativeEncoder(
+      num_layers,
+      num_heads,
+      hidden_dim,
+      mlp_dim,
+      dropout,
+      attention_dropout,
+      norm_layer,
+    )
+
+
+    self.ecfp_sim = 'rbf'
+
+    if self.ecfp_sim == 'cosine':
+      self.fc = nn.Sequential(
+        nn.Linear(2048, 512),
+        nn.ReLU(),
+        nn.Dropout(dropout),
+        nn.Linear(512, 128),
+      )
+      # bias & scale of cosine classifier
+      self.cosine_sim = torch.nn.CosineSimilarity(dim=2)
+      self.bias = nn.Parameter(torch.FloatTensor(1).fill_(0), requires_grad=True)
+      self.scale_cls = nn.Parameter(torch.FloatTensor(1).fill_(10), requires_grad=True)
+    elif self.ecfp_sim == 'rbf':
+      k = 5
+      self.affine = torch.nn.Linear(1, 1, bias=True)
+      self.mu = torch.nn.Parameter(torch.randn(1, k, 1, 1))
+      self.sigma = torch.nn.Parameter(torch.randn(1, k, 1, 1))
+      self.w1 = torch.nn.Parameter(torch.randn(k,k))
+      self.w2 = torch.nn.Parameter(torch.randn(k, 1))
+      self.gelu = torch.nn.GELU()
+
+
+  def forward(self, x, y, context_length, *args, **kwargs):
+    # TODO(cfifty): another option is to integrate these into self-attention in a manner similar to relative
+    # TODO(cfifty): positional embeddings: softmax(QK^T + ecfp_sim) where ecfp_sim is a nxn matrix of similarities.
+    fp = x.fingerprints.to(torch.float32)
+    if self.ecfp_sim == 'cosine':
+      fp = self.fc(fp)
+
+    # Step 1: Extract molecular graph features with a GNN.
+    x = self.gnn_extractor(x)
+    y = self.class_emb(torch.unsqueeze(y, 1))
+
+    # Step 2: Map the first extracted features to a "guess" label.
+    B, _ = x.shape
+    x = x.reshape(B // context_length, context_length, -1)
+    y = y.reshape(B // context_length, context_length, -1)
+    fp = fp.reshape(B // context_length, context_length, -1).repeat_interleave(context_length, dim=0)
+
+    # Repeat each example |context| so that we predict on each molecule in the context.
+    x, y, gather_idx = replicate_batch(x, y)
+    query_mask = torch.eye(context_length, device=x.device, dtype=torch.bool).repeat(B // context_length, 1).unsqueeze(
+      -1)
+    y += self.label_emb * query_mask - y * query_mask  # Replace the true label w/ the masked token.
+    x = torch.cat((x, y), dim=-1)
+
+    if self.ecfp_sim == 'cosine':
+      # Compute ECFP similarity.
+      ecfp_1 = F.normalize(fp.unsqueeze(2), p=2, dim=-1, eps=1e-12)
+      ecfp_2 = F.normalize(fp.unsqueeze(1), p=2, dim=-1, eps=1e-12)
+      ecfp_sim = self.scale_cls * (torch.einsum('bald,blcd->bac', ecfp_1, ecfp_2) + self.bias)
+    elif self.ecfp_sim == 'rbf':
+      # fp: [128, 128, 2048]
+      b, c, d = fp.shape
+
+      # Jaccard similarity: not great because we can have [2, 0, 0] counts so diagonal isn't highest element.
+      # ecfp_sim = torch.einsum('bald,blcd->bac', fp.unsqueeze(2), fp.unsqueeze(1)) / fp.shape[-1]
+
+      # Tanimoto similarity: (A \cap B) / (A + B - A \cap B) -- much better (diagonals now 1).
+      ecfp_sim = torch.sum(torch.minimum(fp.unsqueeze(2), fp.unsqueeze(1)), dim=-1)
+      ecfp_sim = ecfp_sim / (torch.sum(fp.unsqueeze(2), dim=-1) + torch.sum(fp.unsqueeze(1), dim=-1) - ecfp_sim)
+
+      ecfp_sim = self.affine(ecfp_sim.unsqueeze(-1))
+      B, C, _, _ = ecfp_sim.shape
+      ecfp_sim = ecfp_sim.reshape(B, 1, C, C)
+      eps = 1e-12
+      # 0.3989 = \sqrt{2*pi}
+      ecfp_rbf = 1 / (0.3989 * self.sigma + eps) * torch.exp(
+        -1 / ((2 * torch.square(self.sigma) + eps) * torch.square(ecfp_sim - self.mu)))
+      ecfp_sim = self.gelu(torch.einsum('bkac,ki->biac', ecfp_rbf, self.w1))
+      ecfp_sim = torch.einsum('biac,if->bfac', ecfp_sim, self.w2).squeeze()
+
+      # Step 3: Pass inputs and labels through the context model.
+      x = self.encoder(x, ecfp_sim)
+
+      # Step 4: Extract refined "guess" label.
+      y = torch.take_along_dim(x, gather_idx.reshape(-1, 1, 1), 1).squeeze()
+
+      # Step 7: Linear projection to determine the label.
+    return self.output_proj(y)
+
+
+class ECFPICL(MoleculeTransformer):
+  def __init__(
+          self,
+          atom_dim: int,
+          num_layers: int,
+          num_heads: int,
+          hidden_dim: int,
+          mlp_dim: int,
+          device: torch.device,
+          dropout: float = 0.0,
+          attention_dropout: float = 0.0,
+          norm_layer: Callable[..., torch.nn.Module] = partial(nn.LayerNorm, eps=1e-6),
+  ):
+    super().__init__(atom_dim, num_layers, num_heads, hidden_dim, mlp_dim, device, dropout, attention_dropout,
+                     norm_layer)
+    self.gnn_icl = ContextTransformer_Orig(32, 12, 12, 768, 3072, device=device)
+    self.gnn_icl.load_state_dict(torch.load('best_model.pt', map_location=device), strict=True)
+
+    # self.ecfp_ff = nn.Sequential(nn.Linear(2048, 1024), nn.ReLU(), nn.Dropout(dropout), nn.Linear(1024, 768),
+    #                              nn.ReLU(), nn.Dropout(dropout), nn.Linear(768, 384))
+    self.ecfp_ff = nn.Sequential(nn.Linear(2048, 384), nn.Dropout(0.2))
+    # Set gnn_extractor to have output_dim = hidden_dim -1 as we later concatenate this rep with the labels.
+    self.encoder = Encoder(
+      num_layers,
+      num_heads,
+      hidden_dim,
+      mlp_dim,
+      dropout,
+      attention_dropout,
+      norm_layer,
+    )
+    # self.pos_encoding_layer = PositionalEncoding(hidden_dim, dropout=dropout, max_len=256)
+    self.class_emb = torch.nn.Linear(in_features=1, out_features=384, bias=False)
+    self.label_emb = torch.nn.Parameter(torch.zeros(1, 1, 384))
+    self.output_proj = torch.nn.Linear(in_features=hidden_dim, out_features=1, bias=False)
+
+  def forward(self, x, y, context_length, *args, **kwargs):
+    # Step 0: get the gnn preds:
+    with torch.no_grad():
+      gnn_logits = self.gnn_icl(x, y, context_length, *args, **kwargs)
+
+    # Step 1: Extract molecular graph features with a GNN.
+    x = self.ecfp_ff(x.fingerprints.to(torch.float32))
+
+    # Combine features across modalities.
+    y = self.class_emb(torch.unsqueeze(y, 1))
+
+    # Step 2: Map the first extracted features to a "guess" label.
+    B, _ = x.shape
+    x = x.reshape(B // context_length, context_length, -1)
+    y = y.reshape(B // context_length, context_length, -1)
+
+    # Repeat each example |context| so that we predict on each molecule in the context.
+    x, y, gather_idx = replicate_batch(x, y)
+
+    # Add positional Embeddings.
+    query_mask = torch.eye(context_length, device=x.device, dtype=torch.bool).repeat(B // context_length, 1).unsqueeze(
+      -1)
+    y += self.label_emb * query_mask - y * query_mask  # Replace the true label w/ the masked token.
+
+    # Concatenate molecule embeddings and label embeddings along last axis.
+    x = torch.cat((x, y), dim=-1)
+    # x = self.pos_encoding_layer(x)  # TODO(cfifty): removing this is v2_no_pos_emb
+
+    # Step 3: Pass inputs and labels through the context model.
+    x = self.encoder(x, None, **kwargs)
+
+    # Step 4: Extract refined "guess" label.
+    # y = x[:, :, C:] # TODO(cfifty): this is simply v2.
+    y = x  # TODO(cfifty): v2_full_dim.
+    y = torch.take_along_dim(y, gather_idx.reshape(-1, 1, 1), 1).squeeze()
+
+    # return self.output_proj(torch.cat([gnn_logits, ecfp_logits], dim=-1))
+    # return self.output_proj(gnn_logits + ecfp_logits)
+
+    # Step 7: Linear projection to determine the label.
+    ecfp_logits = self.output_proj(y)
+    # return ecfp_logits
+
+    return (ecfp_logits + gnn_logits) / 2
+
+  def forward_test(self, train_examples, test_examples, train_labels, test_labels):
+    context_length = train_examples.fingerprints.shape[0]
+    gnn_logits = self.gnn_icl.forward_test(train_examples, test_examples, train_labels, test_labels, context_length)
+
+    # Step 1: Extract molecular graph features with a GNN.
+    train_examples = self.ecfp_ff(train_examples.fingerprints.to(torch.float32))
+    test_examples = self.ecfp_ff(test_examples.fingerprints.to(torch.float32))
+
+    B, C = train_examples.shape
+    train_examples = train_examples.reshape(1, context_length, C)
+    train_labels = self.class_emb(torch.unsqueeze(train_labels, -1)).reshape(1, context_length, -1)
+
+    B, _ = test_examples.shape
+    train_examples = train_examples.repeat((B, 1, 1))
+    train_labels = train_labels.repeat((B, 1, 1))
+
+    # 8.4.23 improvement: Use the full sequence rather than replacing the first element.
+    features = torch.cat((test_examples.reshape((B, 1, -1)), train_examples), dim=1)
+    labels = torch.cat((self.label_emb.repeat(B, 1, 1), train_labels), dim=1)
+    x = torch.cat((features, labels), dim=-1)
+
+    # Step 3: Pass inputs and labels through the context model.
+    x = self.encoder(x, None)
+    y = x[:, 0, :]
+
+    # Step 7: Linear projection to determine the label.
+    ecfp_logits = self.output_proj(y)
+    return (ecfp_logits + gnn_logits) / 2
 
 
 class ProtoICL(ContextTransformer_Orig):
@@ -385,7 +685,7 @@ class ProtoICL(ContextTransformer_Orig):
     x = self.encoder(demonstrations, None)
 
     # Extract query and aggregate support into centroids.
-    query = x[:,[0],:]
+    query = x[:, [0], :]
     pos_centroids_mask = torch.where(labels == 1.0, 1.0, 0.0)
     neg_centroids_mask = torch.where(labels == 0.0, 1.0, 0.0)
     num_pos = (torch.sum(pos_centroids_mask, dim=1)).unsqueeze(-1)
@@ -588,7 +888,7 @@ class ECFPProtoICL(ContextTransformer_Orig):
     x = self.encoder(demonstrations, None)
 
     # Extract query and aggregate support into centroids.
-    query = x[:,[0],:]
+    query = x[:, [0], :]
     pos_centroids_mask = torch.where(labels == 1.0, 1.0, 0.0)
     neg_centroids_mask = torch.where(labels == 0.0, 1.0, 0.0)
     num_pos = (torch.sum(pos_centroids_mask, dim=1)).unsqueeze(-1)
@@ -1095,6 +1395,36 @@ def _molecule_transformer(
       device=device,
       **kwargs,
     )
+  elif model_type == 'ContextTransformer_ECFP':
+    model = ContextTransformer_ECFP(
+      atom_dim=atom_dim,
+      num_layers=num_layers,
+      num_heads=num_heads,
+      hidden_dim=hidden_dim,
+      mlp_dim=mlp_dim,
+      device=device,
+      **kwargs,
+    )
+  elif model_type == 'ContextTransformer_Relative':
+    model = ContextTransformer_Relative(
+      atom_dim=atom_dim,
+      num_layers=num_layers,
+      num_heads=num_heads,
+      hidden_dim=hidden_dim,
+      mlp_dim=mlp_dim,
+      device=device,
+      **kwargs,
+    )
+  elif model_type == 'ECFPICL':
+    model = ECFPICL(
+      atom_dim=atom_dim,
+      num_layers=num_layers,
+      num_heads=num_heads,
+      hidden_dim=hidden_dim,
+      mlp_dim=mlp_dim,
+      device=device,
+      **kwargs,
+    )
   elif model_type == 'ProtoICL':
     model = ProtoICL(
       name='ProtoICL',
@@ -1186,7 +1516,7 @@ def mt_base_32(*, device=torch.device('cuda:0'), weights=None,
   """53705MiB in GPU"""
   return _molecule_transformer(
     atom_dim=32,
-    num_layers=12,
+    num_layers=2,
     num_heads=12,
     hidden_dim=768,
     mlp_dim=3072,

@@ -53,11 +53,11 @@ def create_optimizer(model,
     param_list.append(param)
   opt = torch.optim.AdamW([{'params': param_list, "lr": lr, "weight_decay": weight_decay}])
 
-  # scheduler = torch.optim.lr_scheduler.LambdaLR(
-  #   optimizer=opt,
-  #   lr_lambda=[partial(linear_warmup, warmup_steps=warmup_steps)]  # for shared paramters],
-  # )
-  scheduler = CustomWarmupCosineSchedule(opt, warmup_steps=warmup_steps, t_total=total_steps, final_lr=lr /10)
+  scheduler = torch.optim.lr_scheduler.LambdaLR(
+    optimizer=opt,
+    lr_lambda=[partial(linear_warmup, warmup_steps=warmup_steps)]  # for shared paramters],
+  )
+  # scheduler = CustomWarmupCosineSchedule(opt, warmup_steps=warmup_steps, t_total=total_steps, final_lr=lr /10)
   return opt, scheduler
 
 
@@ -112,15 +112,22 @@ def run_on_data_iterable(
       optimizer.zero_grad()
     labels = labels.to(torch.float32)
 
-    # Compute model predictions for this batch as well as the loss.
-    preds, labels = model(batch, labels, context_length=context_length)
+
+    # Step 1: compute the loss with the typical labels.
+    preds = model(batch, labels, context_length=context_length)
     if not preds.shape[0]: continue  # Skip if no legit batches.
-    # orig_labels = labels.clone()
-    # orig_labels = torch.reshape(orig_labels, (orig_labels.shape[0] // context_length, context_length, 1))[:, 0].squeeze(
-    #   dim=-1)
     if hasattr(model, 'name') and model.name == 'ProtoICL':
       labels = labels.to(torch.int64)
     mean_loss, loss = compute_loss(loss_fn, preds, labels)
+
+    # Step 2: compute the loss with the reverse labels.
+    rev_labels = (~(labels.to(torch.bool))).to(torch.float32)
+    preds = model(batch, rev_labels, context_length=context_length)
+    if hasattr(model, 'name') and model.name == 'ProtoICL':
+      rev_labels = rev_labels.to(torch.int64)
+    rev_mean_loss, rev_loss = compute_loss(loss_fn, preds, rev_labels)
+
+    mean_loss = (mean_loss + rev_mean_loss) / 2
 
     # Reuse their metric logging for consistency; it also seems to be not bad.
     metric_logger_loss = TorchFSMolModelLoss(label_loss=mean_loss)
@@ -166,7 +173,7 @@ def compute_valid_loss(
       # orig_labels = labels.clone()
 
       # Compute model predictions for this batch as well as the loss.
-      preds, labels = model(batch, labels, context_length=context_length)
+      preds = model(batch, labels, context_length=context_length)
       if not preds.shape[0]: continue  # Skip if no legit batches.
       # orig_labels = torch.reshape(orig_labels, (orig_labels.shape[0] // context_length, context_length, 1))[:,
       #               0].squeeze(dim=-1)

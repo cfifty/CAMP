@@ -45,8 +45,8 @@ logger = logging.getLogger(__name__)
 
 **** Orig Context Model ****
 python context_model_pretrain.py ../fsmol_datasets --batch_sizes 256 256 256 256 256 \
-    --context_lengths 256 128 64 32 16 --model_size base --save-dir orig_drop_path --num_epochs 100 \
-    --task-list-file datasets/fsmol-0.1.json --model_type ContextTransformer_orig --cuda 4 --attention_dropout 0.2 \
+    --context_lengths 256 128 64 32 16 --model_size base --save-dir layers_ablation --num_epochs 100 \
+    --task-list-file datasets/fsmol-0.1.json --model_type ContextTransformer_orig --cuda 6 --attention_dropout 0.2 \
      --dropout 0.2 --warmup_steps 2000 --learning-rate 5e-5
     
     
@@ -80,7 +80,8 @@ def make_model(args, model_size: Text, model_type: Text = 'MoleculeTransformer',
   if model_size == 'medium':
     return mt_medium_32(device=device, model_type=model_type, dropout=args.dropout, attention_dropout=args.attention_dropout)
   if model_size == 'base':
-    return mt_base_32(device=device, model_type=model_type, dropout=args.dropout, attention_dropout=args.attention_dropout, metric=args.metric)
+    return mt_base_32(device=device, model_type=model_type, dropout=args.dropout, attention_dropout=args.attention_dropout)
+    # return mt_base_32(device=device, model_type=model_type, dropout=args.dropout, attention_dropout=args.attention_dropout, metric=args.metric)
   elif model_size == 'large':
     return mt_large_32(device=device, model_type=model_type, dropout=args.dropout, attention_dropout=args.attention_dropout)
   elif model_size == 'huge':
