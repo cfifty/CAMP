@@ -61,8 +61,17 @@ python fs_mol/context_modeling_test.py . ../fsmol_datasets --save-dir ../v2_mlcm
 
 
 *******Rebuttal Models*********
-python fs_mol/context_modeling_test.py . ../fsmol_datasets --save-dir MH128  --model_type ProtoICL \
---model_path 'mahalanobis/ProtoICL_mahalanobis_base_5e-05_0.0_400000_100_[128, 16]_[256, 256]_0.0_ProtoICL_2023-08-05_19-25-46/best_model.pt'  
+To run the test script
+python fs_mol/context_modeling_test.py . ../fsmol_datasets --model_type ProtoICL --model_path 'mahalanobis/ProtoICL_mahalanobis_base_5e-05_0.0_400000_100_[128, 16]_[256, 256]_0.0_ProtoICL_2023-08-05_19-25-46/best_model.pt' \
+--metric mahalanobis --model_size base --cuda 0
+
+To collect the results
+python fs_mol/plotting/collect_eval_runs.py MH_128 mahalanobis/MH128 --support-set-sizes 8,16,32,64,128
+
+
+***** Relative Attention Models******
+python fs_mol/context_modeling_test.py . ../fsmol_datasets --model_type ContextTransformer_Relative --model_path 'layers_ablation/num_layers_6_tanimoto_relative/best_model.pt' \
+ --model_size base --cuda 3
 """
 
 
@@ -145,8 +154,11 @@ def main():
   out_dir, dataset = set_up_test_run("Multitask", args, torch=True)
 
   # Recreate the outdir.
-  out_dir = os.path.join(args.save_dir, f'{args.model_path.split("/")[2]}_{args.train_sizes[0]}')
-  os.makedirs(out_dir, exist_ok=True)
+  # out_dir = os.path.join(args.save_dir, f'{args.model_path.split("/")[2]}_{args.train_sizes[0]}')
+  # os.makedirs(out_dir, exist_ok=True)
+
+  # overwrite outdir to be the model dir: save-dir is now irrelevant.
+  out_dir = '/'.join(args.model_path.split('/')[:-1])
   set_up_logging(os.path.join(out_dir, f"eval_run.log"))
 
   device = torch.device(f"cuda:{args.cuda}" if torch.cuda.is_available() else "cpu")
@@ -156,8 +168,9 @@ def main():
   #   '/lfs/local/0/fifty/context_modeling/v3/ContextTransformer_v3_base_5e-05_0.0_0.0_100_256_ContextTransformer_v3_2023-04-20_13-51-50/best_model.pt'))
   # model.load_state_dict(torch.load(
   #   '/lfs/local/0/fifty/context_modeling/v2_full_dim/ContextTransformer_v2_base_5e-05_0.0_0.0_100_256_ContextTransformer_v2_2023-04-22_17-45-08/best_model.pt'))
-  model.load_state_dict(torch.load(args.model_path))
+  model.load_state_dict(torch.load(args.model_path, map_location=device))
   embedding_model = lambda x: x.node_features  # pass through or something.
+  model.to(device)
 
   def test_model_fn(
           task_sample: FSMolTaskSample, temp_out_folder: str, seed: int

@@ -22,6 +22,7 @@ from utils.cli_utils import add_train_cli_args, set_up_train_run
 
 SMALL_NUMBER = 1e-7
 logger = logging.getLogger(__name__)
+torch.autograd.set_detect_anomaly(True)
 
 """
 **********Testing***********

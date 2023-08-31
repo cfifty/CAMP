@@ -136,7 +136,6 @@ def run_on_data_iterable(
     # Training step:
     if optimizer is not None:
       mean_loss.backward()
-
       torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
       optimizer.step()
     if lr_scheduler is not None:
