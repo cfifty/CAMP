@@ -1,0 +1,30 @@
+{
+  "train": [
+  ],
+  "valid": [],
+  "test": [
+    "bace_0",
+    "sider_0",
+    "sider_1",
+    "sider_3",
+    "sider_4",
+    "sider_5",
+    "sider_8",
+    "sider_9",
+    "sider_10",
+    "sider_12",
+    "sider_14",
+    "sider_15",
+    "sider_18",
+    "sider_19",
+    "sider_20",
+    "sider_21",
+    "sider_23",
+    "sider_24",
+    "sider_26",
+    "tox21_2",
+    "tox21_4",
+    "tox21_7",
+    "tox21_10"
+  ]
+}

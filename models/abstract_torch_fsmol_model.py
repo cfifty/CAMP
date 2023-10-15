@@ -7,10 +7,13 @@ import sys
 import time
 from abc import abstractclassmethod, abstractmethod
 from functools import partial
+from collections import defaultdict
 from typing import (
     Tuple,
     Dict,
     Optional,
+    DefaultDict,
+    List,
     Iterable,
     Union,
     Type,
@@ -25,10 +28,18 @@ from pyprojroot import here as project_root
 
 sys.path.insert(0, str(project_root()))
 
+from data import (
+  FSMolBatcher,
+  FSMolBatchIterable,
+  FSMolTaskSample,
+)
+
 from utils.logging import PROGRESS_LOG_LEVEL
-from utils.metric_logger import MetricLogger
 from utils.metrics import (
-    BinaryMetricType,
+  avg_task_metrics_list,
+  compute_metrics,
+  BinaryEvalMetrics,
+  BinaryMetricType,
 )
 
 logger = logging.getLogger(__name__)
@@ -144,6 +155,164 @@ class AbstractTorchFSMolModel(
     ) -> AbstractTorchFSMolModel[BatchFeaturesType, BatchOutputType, BatchLossType]:
         """Build the model architecture based on a saved checkpoint."""
         raise NotImplementedError()
+
+def eval_context_model(
+        model,
+        embedding_model,
+        task_sample: FSMolTaskSample,
+        batcher: FSMolBatcher[BatchFeaturesType, torch.Tensor],
+        learning_rate: float,
+        task_specific_learning_rate: float,
+        metric_to_use: MetricType = "avg_precision",
+        max_num_epochs: int = 50,
+        patience: int = 10,
+        seed: int = 0,
+        quiet: bool = False,
+        device: Optional[torch.device] = None,
+) -> BinaryEvalMetrics:
+  train_data = FSMolBatchIterable(task_sample.train_samples, batcher, shuffle=True, seed=seed)
+  train_batch = train_labels = None
+  # TODO(cfifty): Perhaps allow this to do multi-batch for when batch_size = 128 but context_length = 256.
+  for batch_idx, (batch, labels) in enumerate(iter(train_data)):
+    train_batch = batch
+    train_labels = labels
+  test_data = FSMolBatchIterable(task_sample.test_samples, batcher)
+  model.eval()
+
+  per_task_preds: DefaultDict[int, List[float]] = defaultdict(list)
+  per_task_labels: DefaultDict[int, List[float]] = defaultdict(list)
+
+  for batch_idx, (batch, labels) in enumerate(iter(test_data)):
+    with torch.no_grad():
+      embedded_features = embedding_model(batch)
+      # This is a no-op if embedding_model is a lambda.
+      batch.node_features = embedded_features
+      predictions = model.forward_test(train_batch, batch, train_labels.to(torch.float32), labels.to(torch.float32))
+      # predictions: BatchOutputType = model.forward_test(train_batch, batch, train_labels.to(torch.float32),
+      #                                                   labels.to(torch.float32), context_length=16)
+
+    # === Finally, collect per-task results to be used for further eval:
+    sample_to_task_id: Dict[int, int] = {}
+    if hasattr(batch, "sample_to_task_id"):
+      sample_to_task_id = batch.sample_to_task_id
+    else:
+      # If we don't have a sample task information, just use 0 as default task ID:
+      sample_to_task_id = defaultdict(lambda: torch.tensor(0))
+
+    # Apply sigmoid to have predictions in appropriate range for computing (scikit) scores.
+    num_samples = labels.shape[0]
+    predicted_labels = torch.sigmoid(predictions).detach().cpu()
+    # predicted_labels = torch.nn.functional.softmax(predictions, dim=1)[:, 1]
+    for i in range(num_samples):
+      task_id = sample_to_task_id[i].item()
+      per_task_preds[task_id].append(predicted_labels[i].item())
+      per_task_labels[task_id].append(labels[i].item())
+
+  metrics = compute_metrics(per_task_preds, per_task_labels)
+  test_loss, _test_metrics = 0.0, metrics
+
+  test_metrics = next(iter(_test_metrics.values()))
+  logger.log(PROGRESS_LOG_LEVEL, f" Test loss:                   {float(test_loss):.5f}")
+  logger.info(f" Test metrics: {test_metrics}")
+  logger.info(
+    f"Dataset sample has {task_sample.test_pos_label_ratio:.4f} positive label ratio in test data.",
+  )
+  logger.log(
+    PROGRESS_LOG_LEVEL,
+    f"Dataset sample test {metric_to_use}: {getattr(test_metrics, metric_to_use):.4f}",
+  )
+  return test_metrics
+
+
+def eval_full_seq_context_model(
+        model,
+        task_sample: FSMolTaskSample,
+        context_batcher: FSMolBatcher[BatchFeaturesType, torch.Tensor],
+        test_batcher: FSMolBatcher[BatchFeaturesType, torch.Tensor],
+        learning_rate: float,
+        task_specific_learning_rate: float,
+        metric_to_use: MetricType = "avg_precision",
+        max_num_epochs: int = 50,
+        patience: int = 10,
+        seed: int = 0,
+        quiet: bool = False,
+        device: Optional[torch.device] = None,
+) -> BinaryEvalMetrics:
+  train_data = FSMolBatchIterable(task_sample.train_samples, context_batcher, shuffle=True, seed=seed)
+  train_batch = train_labels = None
+  # TODO(cfifty): Perhaps allow this to do multi-batch for when batch_size = 128 but context_length = 256.
+  for batch_idx, (batch, labels) in enumerate(iter(train_data)):
+    train_batch = batch
+    train_labels = labels
+  test_data = FSMolBatchIterable(task_sample.test_samples, test_batcher)
+  model.eval()
+
+  per_task_preds: DefaultDict[int, List[float]] = defaultdict(list)
+  per_task_labels: DefaultDict[int, List[float]] = defaultdict(list)
+
+  for batch_idx, (batch, labels) in enumerate(iter(test_data)):
+    print(f'batch_idx: {batch_idx}')
+    with torch.no_grad():
+      ctx_len = context_batcher._max_num_graphs
+      active_preds = model.forward_full_context_test(train_batch, batch, train_labels.to(torch.float32),
+                                                     fake_test_label=torch.Tensor([1.0]).to(device),
+                                                     context_length=ctx_len)
+      active_preds = torch.sigmoid(active_preds)
+      inactive_preds = model.forward_full_context_test(train_batch, batch, train_labels.to(torch.float32),
+                                                       fake_test_label=torch.Tensor([0.0]).to(device),
+                                                       context_length=ctx_len)
+      inactive_preds = torch.sigmoid(inactive_preds)
+
+      # Change demonstrations with zero probability to have p(label=0) rather than p(label=1)
+      # as we compute P(X=1, Y=?, Z=0) joint probability.
+      zero_label_mask = (train_labels.unsqueeze(-1).repeat((labels.shape[0], 1)) == 0.)
+
+      # TODO(cfifty): also consider multiplying by P(Y) at the very end. O.w. assuming uniform prior vs. prior defined
+      # TODO(cfifty): by the support set.
+      active_preds[zero_label_mask] = 1.0 - active_preds[zero_label_mask]
+      active_preds = torch.prod(active_preds.reshape((-1, ctx_len, 1)), dim=1)
+
+      inactive_preds[zero_label_mask] = 1.0 - inactive_preds[zero_label_mask]
+      inactive_preds = torch.prod(inactive_preds.reshape((-1, ctx_len, 1)), dim=1)
+
+      # Normalize P(X=1, Y=?, Z=0) by active and inactive: must add up to 1
+      # active_preds /= (active_preds + inactive_preds)
+
+      # Make a prediction based on which one is higher.
+      active_preds = torch.argmax(torch.cat((inactive_preds, active_preds), dim=1), dim=1).to(torch.float32)
+      # raise
+
+
+    # === Finally, collect per-task results to be used for further eval:
+    sample_to_task_id: Dict[int, int] = {}
+    if hasattr(batch, "sample_to_task_id"):
+      sample_to_task_id = batch.sample_to_task_id
+    else:
+      # If we don't have a sample task information, just use 0 as default task ID:
+      sample_to_task_id = defaultdict(lambda: torch.tensor(0))
+
+    # Apply sigmoid to have predictions in appropriate range for computing (scikit) scores.
+    num_samples = labels.shape[0]
+    predicted_labels = active_preds.detach().cpu()
+    for i in range(num_samples):
+      task_id = sample_to_task_id[i].item()
+      per_task_preds[task_id].append(predicted_labels[i].item())
+      per_task_labels[task_id].append(labels[i].item())
+
+  metrics = compute_metrics(per_task_preds, per_task_labels)
+  test_loss, _test_metrics = 0.0, metrics
+
+  test_metrics = next(iter(_test_metrics.values()))
+  logger.log(PROGRESS_LOG_LEVEL, f" Test loss:                   {float(test_loss):.5f}")
+  logger.info(f" Test metrics: {test_metrics}")
+  logger.info(
+    f"Dataset sample has {task_sample.test_pos_label_ratio:.4f} positive label ratio in test data.",
+  )
+  logger.log(
+    PROGRESS_LOG_LEVEL,
+    f"Dataset sample test {metric_to_use}: {getattr(test_metrics, metric_to_use):.4f}",
+  )
+  return test_metrics
 
 
 
