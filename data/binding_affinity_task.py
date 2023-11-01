@@ -48,14 +48,8 @@ class BindingAffinityTask:
                     adjacency_lists.append(np.zeros(shape=(0, 2), dtype=np.int64))
 
             # TODO(cfifty): account for the cases where we run on a dataset without dist stats.
-            if 'dist_matrix' not in raw_sample:
-                dist_matrix = np.zeros((5, 5))
-            else:
-                dist_matrix = np.array(raw_sample['dist_matrix'])
-            if 'normalized_adj_matrix' not in raw_sample:
-                normalized_adj_matrix = np.zeros((5, 5))
-            else:
-                normalized_adj_matrix = np.array(raw_sample['normalized_adj_matrix'])
+            dist_matrix = np.zeros((5, 5))
+            normalized_adj_matrix = np.zeros((5, 5))
 
             # 'Property' corresponds to the boolean label -- if it's not in the data file, then it is a regression.
             if 'Property' not in raw_sample:

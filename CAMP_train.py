@@ -2,6 +2,7 @@ import argparse
 import logging
 import os
 import sys
+import wandb
 
 import torch
 from pyprojroot import here as project_root
@@ -20,8 +21,19 @@ logger = logging.getLogger(__name__)
 To train on IGNITE:
 python CAMP_train.py ../ignite_dataset --batch_sizes 256 256 256 256 256 \
     --context_lengths 256 128 64 32 16 --save-dir ignite --num_epochs 100 \
-    --task-list-file datasets/ignite_data.json --model_type CAMP --cuda 1 --attention_dropout 0.2 \
+    --task-list-file datasets/ignite_data.json --model_type CAMP --cuda 3 --attention_dropout 0.2 \
      --dropout 0.2 --warmup_steps 2000 --learning-rate 5e-5
+     
+To test training on IGNITE:
+python CAMP_train.py ../small_ignite_dataset --batch_sizes 256 \
+    --context_lengths 16 --save-dir ignite --num_epochs 100 \
+    --task-list-file datasets/ignite_data.json --model_type CAMP --cuda 0 --attention_dropout 0.2 \
+     --dropout 0.2 --warmup_steps 2000 --learning-rate 5e-5
+     
+python CAMP_train.py ../small_fsmol_datasets --batch_sizes 256 \
+  --context_lengths 16 --save-dir ignite --num_epochs 100 \
+  --task-list-file datasets/fsmol-0.1.json --model_type CAMP --cuda 0 --attention_dropout 0.2 \
+   --dropout 0.2 --warmup_steps 2000 --learning-rate 5e-5
 
 To train:
 python CAMP_train.py ../fsmol_datasets --batch_sizes 256 256 256 256 256 \
@@ -38,12 +50,28 @@ python CAMP_train.py ../small_fsmol_datasets --batch_sizes 256 256 256 256 \
 
 """
 
+def init_wandb(args):
+  wandb.init(
+    project='camp',
+    config={
+      'dataset': args.DATA_PATH,
+      'batch_sizes': args.batch_sizes,
+      'context_lengths': args.context_lengths,
+      'model': args.model_type,
+      'lr': args.learning_rate,
+      'dropout': args.dropout,
+      'attn_dropout': args.attention_dropout,
+      'warmup_steps': args.warmup_steps
+    }
+  )
+
 
 def main():
   parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
   add_train_cli_args(parser)
   add_train_loop_arguments(parser)
   args = parser.parse_args()
+  init_wandb(args)
   save_name = (
     f'{args.model_type}__{args.learning_rate}_{args.dropout}_{args.total_steps}_{args.warmup_steps}'
     f'_{args.context_lengths}_{args.batch_sizes}_{args.attention_dropout}')
@@ -91,6 +119,7 @@ def main():
     aml_run=aml_run,
     out_dir=out_dir,
   )
+  wandb.finish()
   torch.save(best_model_state, os.path.join(out_dir, f"best_model.pt"))
 
 

@@ -54,7 +54,7 @@ class FSMolDataset:
         self._num_workers = num_workers if num_workers is not None else os.cpu_count() or 1
         # TODO(cfifty): consider increasing the number of workers back to os.cpu_count()..
         # TODO(cfifty): change back to a reasonable #.
-        self._num_workers = 20
+        self._num_workers = 10
         # TODO(cfifty): comment out following line when ***not*** debugging.
         # self._num_workers = 0 #TODO(cfifty): comment out this line when done debugging.
         logger.info(f"Identified {len(self._fold_to_data_paths[DataFold.TRAIN])} training tasks.")

@@ -3,6 +3,8 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import wandb
+
 from typing import (
   Tuple,
   Optional,
@@ -70,6 +72,9 @@ def train_one_epoch(
     if optimizer is not None:
       optimizer.zero_grad()
     labels = labels.to(torch.float32)
+
+    # print(batch.device)
+    # logger.info(logging.INFO, labels.device)
 
     # Compute the loss.
     preds = model.forward_train(batch, labels, context_length=context_length)
@@ -194,6 +199,10 @@ def train_loop(
     valid_loss = np.mean(context_valid_losses)
     logger.log(log_level, f"  Total valid loss averaged across contexts: {valid_loss:.5f}")
     valid_losses.append(valid_loss)
+
+    wandb.log(
+      {'val_loss': valid_loss, 'train_loss': np.mean(context_train_losses), 'lr': lr_scheduler.get_last_lr()[0]},
+      step=epoch)
 
     # Consider early stopping.
     if valid_loss < best_valid_loss:

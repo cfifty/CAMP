@@ -73,15 +73,7 @@ def set_up_train_run(
         directory=RichPath.create(args.DATA_PATH),
         task_list_file=RichPath.create(args.task_list_file),
     )
-
-    if args.azureml_logging:
-        from azureml.core.run import Run
-
-        aml_run = Run.get_context()
-    else:
-        aml_run = None
-
-    return out_dir, fsmol_dataset, aml_run
+    return out_dir, fsmol_dataset, None
 
 
 def str2bool(v: Union[str, bool]) -> bool:
